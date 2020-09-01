@@ -1,0 +1,1003 @@
+***********************************************************************
+  Auto-registration Features
+***********************************************************************
++ automatic self-registration in own directory (on-init)
++ automatic resolving of meta addresses w/ buffering of msgs
++ automatic forwarding to role address like "#/main/@worker" (if entry is public, default - not)
+  + support for tcp://127.0.0.1:5555/main/@18781712
++ on remote registration @ directory assign unique ID
++ resolve: return only addresses w/ same protocol
++ when new node is registered with auto-gen ID & dir exists - forward reg req
++ when dir entry not found in local dir, forward request to node own remote dir
+
+ Automatic address resolving
+***********************************************************************
+Description:
+- find real name for meta value in local dir
+- if found - add entry (target -> found-address) and (service -> found-address)
+- if not found in local directory:
+  - send message "core.advertise" with meta-name to directory service
+    (if configured)
+  - wait for result (using task or handler object) - x msecs,
+  - every node scans own directory and returns own address if matched
+    - @alias -> own-addr/@alias
+    - on message arrived at own-addr/@alias message is forwarder to @alias
+    - example:
+      - register      : (@worker, "#/main/WorkQueue")
+      - send advert.  : "@worker"
+      - return as     : "#/main/@worker"   // own address corrected to contain compatible protocol
+      - on msg to     : "#/main/@worker"   // address ends with alias
+      - forward to    : "#/main/WorkQueue"
+  - add entry on result
+  - on first entry found - forward message
+  - on resolving timeout - return error "unknown address"
+
+  Addresses
+***********************************************************************
+
+Address formats:
+  protocol::address
+
+protocol:
+  inproc (default)
+  npq - named pipes      
+  tcp - 0MQ, example: tcp://127.0.0.1:5555/main/
+  ipc - 0MQ
+  pgm - 0MQ
+  bmq - boost msg queue, address format "gate178721" / gate<process-id>
+        example: "bmq::gate178721"
+        example2: "bmq::exec_gate"
+        example3: "bmq::#gate4744/main"
+
+address:
+  #host/node/task, where
+    - "host" is gate, computer & process address,
+    - "node" is logical node address inside process handling the gate;
+             default node is "main" with address "#/main/"
+    - "task" is a task ID
+  @role - virtual role address, can return 1 or more addresses
+          must be registered prior to use
+  virtual-path - virtual path, must be registered prior to use
+
+Standard @roles:
+  @this      - means "receiving node", message will not be forwarded further
+  @worker    - standard work queueu address where client's requests should be forwarded
+  @master    - worker node supervisor where workers should listen for work
+  @directory - NIU
+  
+Unnamed roles:
+  directory  - (set_directory) - service address where names can be resolved
+  dispatcher - target address where all "unknown receiver" messages are forwarded, default value = current node address
+  
+Virtual message address:
+  Virtual address is handled by node registry and can be:
+  'simple-name' - simple unique ID with characters: 'a-zA-Z0-9\-\_'
+  '@role-name'  - common role that can exist on each node
+  '\\path\to\node' - virtual, unique path to computer,node or task
+
+Indirect address:
+  #/main/@worker - indirect address, means "node registered as '@worker' at '#/main/'"
+                   uses role name instead of task ID
+  other examples: tcp://127.0.0.1:5555/main/@18781712
+
+***********************************************************************
+  Script files
+***********************************************************************
+Standard script file name is "*.dcf"
+
+Command syntax
+  script-file: <line> [<line>...]
+  line: [request-list] [comment] <NL>
+  comment: ";" <comment-text>
+  comment-text: <any-printable-ascii-char> [<comment-text>]
+  request-list: <request> [":" request-list]
+  request: [<address>] <command> <param-list>
+  address: see above (address format)
+  command: <interface> "." <command-name>
+  param-list: <param-value> ["," <param-list>]
+  param-value: <name> "=" <value>
+  value: (<value-integer> | <value-string>)
+  value-string: value-string-quote | value-string-apos
+  value-string-quote: '"' [<value-chars-q>] '"'
+  value-string-apos: "'" [<value-chars-a>] "'"
+  value-chars-q: (<ascii-char> | '""') [value-chars-q]
+  value-chars-a: (<ascii-char> | "''") [value-chars-a]
+
+Script variables
+  Defined by "set_var", used with "#" before and after name of var,
+
+  Example:
+  run '#work_dir#\initjq.dcf'
+
+Pre-defined variables:
+  "_PID"        - active process ID
+  "_EXEC_DIR"   - active executable directory
+  "_EXEC_FNAME" - active executable file name
+  "_EXEC_PATH"  - active executable path (dir + file name)
+
+Multi-command lines - separated by ":"
+
+  core.set_var child,'true':core.flush_events:run '#work_dir#\initjq.dcf'
+
+Comments - started with ';' as first non-blank char in line
+
+  ;initialization script file for job queue tests
+
+***********************************************************************
+  Standard message contents
+***********************************************************************
+Envelope:
+- sender: string - used for addressing reply
+- receiver: string - used for addressing tasks & nodes inside connected node
+- timeout: int - how long message can wait
+- event: node - message details
+
+Event (Message / Response):
+- request_id: int (= -1)
+- is_response: bool (= false)
+
+Message (event with "is_response" = "false")
+- command: string
+- params: node
+
+Response (event with "is_response" = "true")
+- status: int
+- error: node (=null)
+- result: node (=null)
+
+***********************************************************************
+  Supported messages
+***********************************************************************
+
+List of messages uses in scheduler
+
+==============================================
+*** Core module
+==============================================
++ [core.]echo([text]) - works like "ping" - returns something or simply arguments
++ get_stats - statistics, # of tasks(act/fin), # of messages(act/fin), # of modules, # of gates
++ reg_node (source, target) - register node as, if source = empty - generate ID & return it
+  - params:
+   + source - source version
+   + target - target version
+   + "public=true" - alias is externally accessible,
+   + "direct_contact=true" - address can be contacted directly (fully resolve on advertise)
+   - "refresh_delay=30" - how long to wait to refresh the registration
+   - "ttl=40" - how long registration should be valid
+   - "single=true" - if single, next registration will replace the old value instead of adding
+   - share_time=30000 - defines how long registration should be active
+     when "borrowed" from directory
++ reg_node_at (exec_at_addr, source_name [,target_name]) - register node at specified node
+  - params:
+    - exec_at_addr - specifies address where message should be sent,
+      - if empty, directory address will be used (set by "set_directory")
+    - source_name - public name for node
+    - auto_source - if (=true) then source_name param is set to
+      registration ID of the sender's scheduler
+    - share_time - specifies how long registration information
+                   can be used on client without refreshing
+  - on success directory can receive new ID of sender for future reference
+    - specified in result
+    - can be read from scheduler as "registrationId"
++ advertise - returns matching aliases
+  - input: role-name[, key] ("@master", "squeue/Work*")
+  - output: service list: address[, type, params]
+  - can be used to ask for nodes or nodes-with-services
++ set_dispatcher (address) - set dispatcher address (node where message should be fwd if unk receiver)
++ set_directory - set address where unknown address is forwarded with request "advertise"
++ set_name (name) - set main node name
++ create_node (class_name [,count [,name]]) - adds a new node(s)
+- core.reg_map (cmd_filter:command-filter, target:target-address [, priority=1])
+- set_alias (name,'command_line') - set alias for command
+- get_alias (name) - returns description of alias
++ set_var (name, value) - define internal variable
++ run (script_file) - run script file
++ run_cmd (cmd="command") - run command
+- add_file_log (file_name) - add file output for log
++ shutdown_node - close node
++ restart_node - restart node
+- import_env (var_name) - import environment variable
+o export_env (var_name) - export environment variable
++ sleep (time-ms) - sleep for specified milliseconds
++ add_gate(input|output, protocol, extra-param-list) - adds gate to active scheduler for a given protocol
++ forward(address, fwd_command, (fwd_params|fwd_params_json)) - send message to address
++ set_option name,value
+  - changes option, possible options:
+    "show_processing_time" - true/false - shows how long message was processed
+    "log_messages" - true/false - logs all messages & results
+
+- if_equ <value1>,<value2>,<command>
+  - perform command if two values are equal
+
+- if_diff <value1>,<value2>,<command>
+  - perform command if two values are different
+  - example:
+    core.if_diff '#child#','true',"job.start_queue name='testq',target='#/GUI/JobQueue',return='wxcs::#/#_PID#/jqtestq'"
+
+- flush_events
+  - perform all commands currently stored in msg queue
+
+==============================================
+*** Simple Queue module
+==============================================
++ squeue.init (qname[,limit]) - returns address of initiated queue (responsible task),
+  creates scSmplQueueManagerTask
+  params:
+  - name: name of queue
+  - type:
+    - rrobin
+    - pull - message can be read on request
+    - mcast - multicast - each reader receives msg
+    - null_dev - nobody will receive message, deleted immediately
+    - forward - use with squeue.listen for forwarding messages to one or more addresses
+    - highav - high availability, only first active reader receives messages
+  - duplex: sender node can receive message from queue
+  - durable: if <true> on failed processing message is not lost but forwarded to another reader
+  - contact_timeout: how many ms can be between received messages from a
+      given reader (0=def - ignore param)
+      on timeout reached - remove reader from queue
+  - result_timeout: how many ms can we wait for result (0=def - ignore param)
+      on timeout reached - migrate message to a different reader
+        change msg-id
+        send message again to next reader
+        do not forward result from a current one
+  + retry_limit - how many times message can be migrated
+  + retry_delay - how long to wait between retries
+  # cluster_fields="fld1;fld2" - defines distribution - fields are used for hash
+  # format - (json,xml,bin)
+
++ squeue.listen (qname, target) - creates a task that will forward message to target,
+    when message is handled, this tasks receives answer and forwards it
+                                   (scSmplQueueReaderTask)
+    you can use it with "forward" queue
++ squeue.listen_at - execute "listen" at a given address
+  params:
+  - exec_at_addr - address where msg should be performed
+  - queue_name - queue name
+  - auto_repair - if <true> then ?
+  - error_delay = 1000 - how long to wait between errors
++ squeue.close (qname) - close queue
++ squeue.list_readers (qname) - list assigned readers
++ squeue.clear (qname) - empty queue
++ squeue.get_status (qname) - returns number of msgs in queue, number of readers
++ squeue.mark_alive(exec_at_addr, queue_name, source_name) - mark sender (source_name) as alive in queue
++ squeue.keep_alive(address, queue_name, msg_limit, delay, error_limit)
+  - sends "mark_alive" every x msecs
+  params:
+  - address="@master" - address of queue manager
+  - queue_name=WorkQueue - name of queue
+  - delay=10000 - sending interval
+  - error_delay=4000 - delay between errors
+  - retry_listen=true - if <true>, sends "listen" after error
+
+==============================================
+- Planned commands
+==============================================
+- squeue.put qname=<queue-name>, msg=<message_body>|msg_list=<message_list:text/json|object/node> - add message to queue
+- squeue.fetch limit=<limit=1> - read message(s) from queue
+- squeue.peek qname=<queue-name>, msg-id=<msg-id> - read message without removing it from queue
+- squeue.pause qname=<queue-name> - change status to "paused", do not send messages to readers, but accept incoming msgs
+- squeue.resume qname=<queue-name> - change status to "running" - normal operation
+- squeue.list_msgs qname=<queue-name>, limit=<max-no-of-rows>, offset=<offset>
+  - returns list of messages (internal id, sender's id, sender_addr, insert time, storage time, retry_count, key)
+- squeue.init_queues defs=<queue-def-list:text/json|object/node> - init several queues at once
+- squeue.close_queues names=<name-list:text/json|object/node> - close list of queues (empty = all)
+- squeue.desc_queues name_filter=<filer_mask:string="*"> - returns definitions of all running queues (empty = all)
+
+==============================================
+- Planned features
+==============================================
+- squeue.get_status - return queue state (null, starting, running, paused)
+- squeue.init reply_addr=<address> - when non-empty, used to return replies for failed messages (timeouts)
+- squeue.init key_suffix=<value> - value added as suffix to each message key
+- squeue.init key_prefix=<value> - value added as prefix to each message key
+- squeue.init key_set=<value> - message key will be set to a given value
+- squeue.listen, squeue.listen_at filter=<filter> - file-like filter based on msg_key field for filtering messages for a given reader,
+  - empty = all,
+  - if it is a string then it is simply filter on msg_key with a given text
+    - if prefix = "~" then negate condition
+  - if it is an object then it can use other fields for filtering:
+    {conditions:[
+    - field=<field_name> - field name for filter (msg_key, command, sender_addr)
+    - value=<filter_value>
+    ],
+    operator:"any" or "all" - specifies how conditions should be interpreted as a set, default = all
+    }
+
+==============================================
+- Some-day commands
+==============================================
+- squeue.restart <params for init> - restart specified queue with maybe different params
+- squeue.reject qname=<queue-name>, msg_id=<msg-id> - return message with reply "message rejected from queue"
+
+
+==============================================
+*** Watchdog module
+==============================================
+- watchdog.init - starts watchdog task which auto-starts k child processes
+  and monitors responsiveness
+  params:
+  - child_path - path to child process
+  - child_params - command line parameters
+    can include "#init_commands#" macro for auto-generated additional commands
+  - delay=10000 - delay between child executions
+  - child_count=auto|<int> - how many processes should be started,
+    auto - select automaticaly
+  - child_talk=true|false - if <true> - sends "echo" message to a child
+    to monitor it's responsiveness
+
+  params to build 'squeue.listen_at' command to be included in CLI params:
+  - work_queue_addr=address - queue manager address
+  - work_queue_name=name - queue name
+  - you can use auto-defined "_PID" variable in these params (child process ID)
+
+  params to build 'core.reg_node_at' command to be included in CLI params:
+  - reg_addr=address - address of child process
+  - you can use auto-defined "_PID" variable in this param (child process ID)
+
+==============================================
+*** Job module - persistent jobs
+==============================================
+- job.define - define job
+
+  params (started with '_' are system params, used by job management functions)
+  - name - name of definition / job
+  - command - command to be executed
+  - base - name of base definition, will be merged with the current one on start
+  - start_paused=0|1 - if = 0 job will be started immediately
+  - config_path=<path>,
+  - chunk_count=4
+  ? chunks_per_commit
+  ? worker
+
+  system params:
+  - _log_level
+  - _msg_level
+  - _priority (0..k), 0 = default, lower value -> higher priority
+  - _job_timeout      - how long job can be running
+  - _trans_timeout    - how long transaction can be uncommited
+  - _retry_limit      - how many times job can be redirected
+  - _trans_sup        - if job uses commits
+  - _timeout=1000     - ?
+
+- job.remove_def <name>
+  - remove job definition with a specified name
+
+- job.change_def - change job definition
+  params:
+  - name - name of definition,
+  - infile1=value1 - sample param change
+
+  example:
+  job.change_def "testdef",infile1="c:\temp\test.txt"
+
+- job.desc_def <job-def-name>
+  - show job defition in log (info)
+
+- job.set_queue_root <queue_name>,<path>
+  - set root dir for jobs from queue (empty - any), used for delete
+
+- job.list_defs <job-def-filter>
+  - list job definitions matching a given filter (uses [%?])
+
+- job.init_manager database-file-path
+  - init job manager, if database does not exists - creates it
+
+- job.start_queue(name, target, return)
+  - start job queue
+  params:
+  - name - name of job queue
+  - target - address of workers queue
+  - return - address of job queue manager, where worker sends messages
+  - purge_interval - how long after job end we have to wait to clear it's log
+  - purge_check_interval - how often we perform purge check process
+
+- job.stop_queue <queue-name>
+  - stops job queue
+
+- job.start name=metagp,queue=testq
+  - start job
+  params:
+  - name: name of job definition
+  - queue: name of job queue
+
+- job.stop <job-id>
+  - stop job processing, cancel it on worker
+
+- job.return
+  - return job to queue, cancel it on worker and submit again to queue
+
+- job.pause <jobid>, <wait=true|false> - temporary stop working on job
+
+- job.resume <jobid> - start from last exec point on any worker
+
+- job.restart queue="testq", job_id=1
+  - starts job from the beginning
+  params:
+  - queue: job queue name
+  - job_id: id of job
+
+- job.purge <job-id>
+  - removes job output: log, transactions, vars, allocations
+
+- job.list_queues
+  - list running job queues
+
+- job.list_jobs [queue-filter]
+  - list running jobs, queue filter is optional, uses [*|?]
+
+worker <-> queue communication
+-------------------------------
+- job.ended - job completed
+- job.set_vars - set job working variables
+- job.get_state - returns job vars
+- job.commit - commit transaction, updates base variables, removes allocations
+  params:
+  - job_id,
+  - trans_id,
+  - chained: bool - if chained, on success returns new trans_id value
+
+- job.rollback - rollback transaction
+  params:
+  - job_id,
+  - trans_id,
+  - chained: bool - if chained, on success returns new trans_id value
+
+- job.alloc_res job_id, trans_id, name=<logic_name>,type="file",path=<path>
+  - allocate resource for job, used to specify work files
+
+  Resource types:
+  - temporary file - file, which will be removed on commit or rollback
+  - obsolete file - file which will be removed only on commit
+  - work file - allocation needed only to control access to file
+
+  See scJobWorkFile for usage.
+
+- job.dealloc_res job_id, trans_id, name=<logic_name>
+  - deallocate resource
+
+- job.log_text severity=<value>,text=<message>,code=<msg_code>
+
+Job worker submodule
+-------------------------------
+- job_worker.start_work command, job_id, lock_id, return_addr
+  - starts worker task, returns "worker_addr" in result
+
+- job_worker.cancel_work <job_id>
+  - stops worker task
+
+==============================================
+*** Http bridge
+==============================================
+- httpb.init <options>
+  - starts HTTP bridge that acts as additional task in the name of
+    HTTP client. HTTP clients are identified using cookie ("clikey").
+  - options:
+    "port"          - (uint) HTTP port to be used
+    "path"          - (str)  HTTP access path
+    "cli_limit"     - (uint) maximum number of concurrent clients
+    "inact_timeout" - (uint) how long client can be inactive before it will be disconnected
+    "msg_timeout"   - (uint) how long message can be handled
+    "resp_limit"    - (uint) how many messages can be stored in response
+    "wait_delay"    - (uint) how long reader can wait for responses to
+                             arrive if there is no responses to return
+    "params"        - json string or node that can contain all above parameters
+
+
+==============================================
+*** Persistent queue
+==============================================
+- pqueue.init <options>
+  - purpose: configures persistent queue module
+  - options:
+    - dbpath=<database-path>
+
+- pqueue.open queue=<name>, <options>
+  - purpose: opens queue with a given name
+  - options (required):
+    - queue=<name>: queue name
+  - options (optional):
+    - exec_addr: address where messages for execution should be sent
+    - reply_to_addr: string - address where execution results should be sent
+    - error_addr: string - address where execution errors should be sent
+    - exec_limit: int - how many messages can be executed in parallel
+    - error_limit: int - how many errors can occur before message will be rejected
+    - error_delay: int - [ms] how long we should wait after error, for exec retry
+    - purge_interval: int - [ms] how long
+    - storage_timeout: int - [ms] how long message can be stored in "ready" state in queue
+    - handle_timeout: int - [ms] how long message can be executed
+    - reply_timeout: int - [ms] how long reply can be handled
+    - archive_fname: string - file name of archive (used in purge process)
+    - base: string - which definition package should be used as base for config params
+                     (see "pqueue.define")
+    - reply_cmd: string - defines default command that should be used
+                          as reply notification.
+                          Can be overwritten by "pqueue.put" option.
+
+  Examples (Python):
+    qopen {"archive_fname":"d:\temp\arch.json"}
+    qopen
+
+- pqueue.close queue=<name>
+  - purpose: close queue (make it inaccessible, keep not-processed-yet messages)
+  - options:
+    - queue=<name>: queue name
+
+  Examples (Python):
+    qclose
+
+- pqueue.define queue=<name>, config=<values:json/node>
+  - purpose: pre-define config params for queue open, can be used to
+             open queue without param specification
+  - options:
+    - queue=<name>: queue name
+    - config: set of config params
+
+  Examples (Python):
+    qdefine {"queue":"testpq","archive_fname":"d:\temp\arch.json"}
+
+- pqueue.undefine queue=<name>
+  - purpose: remove queue definitions specified by "pqueue.define"
+  - options:
+    - queue=<name>: queue name
+
+  Examples (Python):
+    qundefine testpq
+
+- pqueue.drop queue=<name>
+  - purpose: drop queue - remove all resources assigned to it
+  - if queue is running, stops it and returns error
+  - options:
+    - queue=<name>: queue name
+
+  Examples (Python):
+    drop testpq
+    qdrop testpq
+
+- pqueue.purge queue=<name>
+  - purpose: clear queue (remove outdated records)
+             use when "purge_interval" option is = 0 (pqueue.open)
+  - options:
+    - queue=<name>: queue name
+
+  Examples (Python):
+    purge
+
+- pqueue.qlist
+  - purpose: list active queues
+
+  Examples (Python):
+    qlist
+
+- pqueue.put
+  - purpose: add message to queue
+  - options:
+    - queue=<name>: queue name
+    - message passed in 2 possible ways:
+      - msg-list: <message> [<msg-list>]
+      - message params - see below
+    - msg-command=<text>
+    - msg-params=<text:json|node>: (optional) parameters
+    - msg-ref=<text>: (optional) reference, user-defined format (can be integer, json, GUID)
+    - reply_cmd: (optional) command used for reply passing
+
+  Examples (Python):
+    put {"msg_command":"core.echo"}
+    ! pqueue.put {"queue":"testpq","msg_command":"core.echo"}
+    ! pqueue.put {"queue":"testpq","msg_command":"core.echo","msg_ref":"9876"}
+    ! pqueue.put {"queue":"testpq","msg_command":"core.echo","msg_ref":"9876","msg_params":"{\"param1\":\"2\"}"}
+
+- pqueue.mlist
+  - purpose: list messages in queue
+  - options:
+    - queue=<name>: queue name
+  - result:
+    - msg-list
+      - msg-id
+      - status
+      - insert-dt
+      - size (command, params)
+
+  Example (Python):
+      mlist testpq
+      mlist
+
+- pqueue.fetch
+  - purpose: read message from queue - for batch processing (once per x ms)
+    Example case: reply processor
+  - processing:
+    - marks message as "locked-for-handling" with auto-generated key
+    - on handling timeout message status is changed to "ready" and
+      lock key is cleared
+    - locked messages are ommited during collection for response
+    - returns messages as a list
+  - options:
+    - queue=<name>: queue name
+    - limit=value: (=1) optional, specifies how many messages can be returned
+  - result:
+    - <lock-key> - key string used for locking records
+    - req-list: <request> [<req-list>]
+    - request: <msg-id> <command> <params>
+
+  Example (Python):
+  ! pqueue.fetch {"queue":"testpq"}
+
+- pqueue.reply
+  - sent when reply_cmd is not specified in pqueue.put
+  - sent as a confirmation of handling to "reply-to" address
+
+- pqueue.handled
+  - purpose: mark message as handled
+  - processing:
+    - when lock key is correct, message is modified
+    - otherwise error is logged "outdated reply arrived"
+    - if unknown msg-id - error is "unknown reply arrived"
+    - if reply is required (reply_to address non-empty)
+      - status is changed to "handled"
+      - action "send reply" is initiated (if required)
+    - otherwise:
+      - status is changed to "purge"
+  - options:
+    - queue=<name>: queue name
+    - lock_id - key string used for locking records, returned in fetch
+    - reply_status - (optional) common reply status, required for single msg
+    - error  - (optional) common reply error
+    - result - (optional) common reply result
+    - message_id - id of message - use for single msg
+    - msg-list=<value:json|node>: <entry> [<entry>...] - use for msg list
+    - entry:
+      - message_id
+      - reply_status - optional
+      - error - optional
+      - result - optional
+
+  Example (Python):
+  ! pqueue.handled {"queue":"testpq","message_id":2,"lock_id":1,"reply_status":0}
+
+- pqueue.lock
+  - purpose: lock message in queue, do not allow it to be processed further
+  - processing: on success, message status will be changed to "locked"
+       and field "old_status" will keep old status value
+       To restore this value is "unlock"
+  - options:
+    - queue=<name>: queue name
+    - message passed in 2 possible ways:
+      - msg-list: <message> [<msg-list>]
+      - message params - see below
+    - message_id=<value>: message ID
+
+  Examples (Python):
+  ! pqueue.lock {"queue":"testpq","message_id":1}
+  lock 10
+
+- pqueue.unlock
+  - purpose: unlock message in queue, allow further processing
+  - processing: on success, message status will be restored to status
+       from field "old_status"
+  - options:
+    - queue=<name>: queue name
+    - message passed in 2 possible ways:
+      - msg-list: <message> [<msg-list>]
+      - message params - see below
+    - message_id=<value>: message ID
+
+  Examples (Python):
+  ! pqueue.unlock {"queue":"testpq","message_id":1}
+  unlock 10
+
+- pqueue.cancel
+  - purpose: cancel message in queue, treat it as an error (user abort)
+  - processing: on success, message status will be changed to "handled"
+  - options:
+    - queue=<name>: queue name
+    - message passed in 2 possible ways:
+      - msg-list: <message> [<msg-list>]
+      - message params - see below
+    - message_id=<value>: message ID
+
+  Examples (Python):
+  ! pqueue.cancel {"queue":"testpq","message_id":1}
+  cancel 10
+
+- pqueue.peek
+  - purpose: read message details without changing it's state
+  - options:
+    - queue=<name>: queue name
+    - message_id=<value>: message ID
+    - reference=<value>: message reference value (can be used instead of msg id)
+
+  Examples (Python):
+  ! pqueue.peek {"queue":"testpq","message_id":1}
+  peek 10
+
+- pqueue.export
+  - purpose: export messages to portable file
+  - options:
+    - queue=<name>: queue name
+    - fpath=<value:string>: file path
+    - message_id=<value>: (optional) message ID
+      - if one message needs to be exported
+    - status=<value:int>: (optional) message status
+      - if only messages with a given status should be exported
+
+  Examples (Python):
+  ! pqueue.export {"queue":"testpq","fpath":"d:/temp/exp1.json"}
+  export d:\temp\test.json
+
+- pqueue.import
+  - purpose: import messages from portable file (as new messages)
+  - options:
+    - queue=<name>: queue name
+    - fpath=<value:string>: file path
+
+  Examples (Python):
+  ! pqueue.import {"queue":"testpq","fpath":"d:/temp/exp1.json"}
+  impport d:\temp\test.json
+
+- pqueue.register
+  - purpose: register queue task as import address in directory
+  - options:
+    - queue=<name>: queue name
+    - alias=<value>: (optional) virtual name in directory
+      - default alias is "@pqueue.<queue-name>"
+    - exec_at_addr: (optional) where task should be registered
+
+  Examples (Python):
+  ! pqueue.register {"queue":"testpq"}
+  ! [@pqueue.testpq] core.echo
+
+==============================================
+*** Database module
+==============================================
+
+- db.init
+  - purpose: configure default settings for module
+  - options:
+    - inact_timeout: [ms] inactivity timeout
+
+  Examples:
+    db.init inact_timeout=1800000
+
+- db.define_db
+  - purpose: define database connection parameters
+  - options:
+    - alias: how definition should be referred
+    - path: connection string to database, contains engine name
+    - proc_enabled: bool - specifies if server procedures should be accessible
+    - proc_dir: file directory where procedures are stored (for Python procs)
+
+  Examples:
+    db.define_db alias="testdb",path="sqlite:#_EXEC_DIR#\data\testdb.db"
+
+- db.define_proc
+  - purpose: define database procedure for future use
+    - used to limit server interface to only selected procedures
+    - undefined procedures are not allowed to be executed by
+      module interface
+  - options:
+    - alias: how definition should be referred
+    - path: procedure code file path
+
+  Examples:
+    db.define_proc alias="proc1",path="#_EXEC_DIR#\proc\proc1.py"
+
+- db.open
+  - purpose: connect to database
+  - options:
+    - db_name: database name ("alias")
+  - result:
+    - cid: connection id
+
+  Examples:
+    db.open db_name="testdb"
+
+- db.close
+  - purpose: close database connection
+  - options:
+    - cid: connection id
+
+  Examples:
+    db.close cid=12121
+
+- db.sql_exec
+  - purpose: execute SQL
+  - options:
+    - sql: query text
+    - db_params: list of parameters in form (name->value)
+      - list can be provided as json-string or directly as datanode
+      - parameter value can be:
+        - direct value
+        - SQL expression in form:
+          expr: true
+          value: <expression-text>
+        - portable function in form:
+          func: true
+          value: <function-name>
+          params: <optional-function-params>
+          - defined portable functions are:
+            - current_dt: current timestamp
+
+  - result:
+    - returns rows-affected value
+
+  Examples:
+    db.sql_exec sql="create table ta(a1 int, a2 int)"
+    db.sql_exec sql="insert into ta(a1, a2) values(1,2)"
+
+  Examples (Python):
+    ! db.sql_exec {"cid":81473,"sql":"create table ta(a1 int, a2 int)"}
+    ! db.sql_exec {"cid":81473,"sql":"insert into ta(a1, a2) values(1,2)"}
+    sql_exec {"sql":"insert into ta(a1, a2) values(1,2)"}
+    sql_exec insert into ta(a1, a2) values(1,2)
+    sql_exec create table tb(a1 int, a2 int, dt timestamp)
+    sql_exec {"sql":"insert into tb(a1, a2, dt) values(3,2,{dt})","db_params":{"dt":{"func":true,"value":"current_dt"}}}
+    sql_exec {"sql":"insert into tb(a1, a2, dt) values(3,2,{dt})","db_params":{"dt":{"expr":true,"value":"current_timestamp"}}}
+
+- db.sql_select
+  - purpose: execute SQL
+  - options:
+    - sql: query text
+    - db_params: see sql_exec
+    - limit: how many rows should be returned at max (=0 means no limit)
+    - offset: how many rows should be skipped from the start of row set
+  - returns selected rows
+
+  Examples:
+    db.sql_select sql="select * from ta where a1 = {a1}", db_params='{"a1":1}'
+
+  Examples (Python):
+    ! db.sql_select {"cid":81473,"sql":"select * from ta where a1 = {a1}","db_params":{"a1":1}}
+    sql_select {"sql":"select * from ta where a1 = {a1}","db_params":{"a1":1}}
+    sql_select {"sql":"select * from ta"}
+    sql_select select * from ta
+    sql_select select count(*) from ta where a1 = 2
+
+- db.read
+  - purpose: read from table w/o using SQL
+  - options:
+    - oname - object (table or view) name
+    - filter: parameters used for filtering rows, in form of pairs (column:value)
+              see sql_exec
+    - columns: optional list of columns to be selected
+    - order: collection of pairs (column:true/false)
+            (true = ascending, false = descending)
+    - limit: how many rows should be returned at max (=0 means no limit)
+    - offset: how many rows should be skipped from the start of row set
+  - returns selected rows
+
+  Examples:
+    db.read oname="ta", filter='{"a1":1}'
+    db.read oname="ta", order='{"a2":false}'
+
+  Examples (Python):
+    ! db.read {"cid":81473,"oname":"ta","filter":{"a1":1}}
+    ! db.read {"cid":81473,"oname":"ta","order":{"a2":false}}
+    ! db.read {"cid":81473,"oname":"ta","filter":{"a1":2}}
+    ! db.read {"cid":81473,"oname":"ta"}
+
+    read {"oname":"ta","order":{"dt":false}}
+    read {"oname":"ta","filter":{"a1":6}}
+
+- db.insert
+  - purpose: insert row w/o using SQL
+  - options:
+    - oname - object (table or view) name
+    - values: parameters used for inserting values, in form of pairs (column:value/expression)
+              see sql_exec
+
+  Examples:
+    db.insert oname="ta", values='{"a1":6}'
+
+  Examples (Python):
+    ! db.insert {"cid":81473,"oname":"ta","values":{"a1":6,"a2":2}}
+    insert {"oname":"ta","values":{"a1":6,"a2":2}}
+
+- db.update
+  - purpose: update row(s) w/o using SQL
+  - options:
+    - oname - object (table or view) name
+    - values: parameters used for updating fields, in form of pairs (column:value/expression)
+              see sql_exec
+    - filter: parameters used for filtering rows being updated
+
+  Examples:
+    db.update oname="ta", values='{"a2":61}', filter='{"a1":2}'
+
+  Examples (Python):
+    ! db.update {"cid":81473,"oname":"ta","values":{"a2":61},"filter":{"a1":2}}
+    update {"oname":"ta","values":{"a2":61},"filter":{"a1":6}}
+
+- db.delete
+  - purpose: delete row(s) w/o using SQL
+  - options:
+    - oname - object (table or view) name
+    - filter: parameters used for filtering rows being updated
+              (required, for full table delete use 1=1)
+
+  Examples:
+    db.delete oname="ta", filter='{"a1":2}'
+
+  Examples (Python):
+    ! db.delete {"cid":81473,"oname":"ta","filter":{"a2":61}}
+    delete {"oname":"ta","filter":{"a2":61}}
+
+- db.begin_trans
+  - purpose: start transaction
+  - options: <none>
+
+  Examples:
+    db.begin_trans
+
+  Examples (Python):
+    ! db.begin_trans {"cid":81473}
+    begin_trans
+    delete {"oname":"ta","filter":{"1":1}}
+    read {"oname":"ta"}
+    rollback
+    read {"oname":"ta"}
+    commit
+
+- db.commit
+  - purpose: commit transaction
+  - options: <none>
+
+  Examples:
+    db.commit
+
+  Examples (Python):
+    - see "begin_trans"
+
+- db.rollback
+  - purpose: rollback transaction
+  - options: <none>
+
+  Examples:
+    db.rollback
+
+  Examples (Python):
+    - see "begin_trans"
+
+- db.exec_proc
+  - purpose: execute procedure on server
+  - options:
+    - name: name of procedure
+    - db_params: list of parameters in form (name->value)
+
+  - result:
+    - exec_status - execution status
+
+  - python procedures
+    - input:
+      - proc_params
+      - db_path
+    - executed procedure: "main"
+
+  Examples (Python):
+    ! db.exec_proc {"cid":81473,"name":"proc1","db_params":{"a":61}}
+    ! db.exec_proc {"cid":81473,"name":"proc2","db_params":{"a":61}}
+
+- db.select_proc
+  - purpose: select data with procedure on server
+  - options:
+    - name: name of procedure
+    - db_params: list of parameters in form (name->value)
+
+  - result:
+    - rows
+
+  - python procedures
+    - input:
+      - proc_params
+      - db_path
+    - executed procedure: "main"
+
+  Examples (Python):
+    ! db.select_proc {"cid":81473,"name":"proc3","db_params":{"a":61}}
+
+- db.meta_list cid=value, obj_type=(T,V,P,I) - list objects (tables, views, procedures, indices)
+- db.meta_obj_exists cid=value, obj_type=(T,V,P,I), obj_name=value:str - returns <true> if object exists
+- db.engine_supports cid=value, flags=value:uint, domain=value:uint - returns support flags
+- db.engine_name cid=value - returns engine name + version
+- db.last_ins_id cid=value - returns last inserted record id
+
+
